@@ -56,7 +56,16 @@ import numpy as np
 import ray
 import requests
 import torch
-import vllm.config
+
+# vllm is only needed for inference/serving helpers in this module, not for data
+# tokenization. On clusters whose container ships a vllm too old for the rest of
+# the stack (e.g. LUMI ROCm), importing it fails or forces a GPU; make it optional
+# so data-side entrypoints (e.g. convert_sft_data_for_olmocore.py) still work.
+try:
+    import vllm.config  # noqa: F401
+except Exception:  # pragma: no cover - environment-dependent
+    vllm = None  # type: ignore
+
 from datasets import DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from datasets.builder import DatasetGenerationError
 from dateutil import parser
@@ -1819,7 +1828,7 @@ class ModelDims:
         return embedding_params + layer_params + lm_head_params
 
     @classmethod
-    def from_vllm_config(cls, vllm_config: vllm.config.VllmConfig) -> "ModelDims":
+    def from_vllm_config(cls, vllm_config: "vllm.config.VllmConfig") -> "ModelDims":
         """Create ModelDims from a vLLM config object."""
         model_config = vllm_config.model_config
         hidden_size = model_config.get_hidden_size()

@@ -69,7 +69,10 @@ from transformers.utils.hub import _CACHED_NO_EXIST, TRANSFORMERS_CACHE, extract
 
 from open_instruct.utils import hf_whoami, max_num_processes
 
-DEBUG_LOG_PATH = "/work/dlclarge2/ferreira-oellm/open-instruct/.cursor/debug.log"
+DEBUG_LOG_PATH = os.environ.get(
+    "OLMOCORE_DEBUG_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset_transformation_debug.log"),
+)
 
 
 def append_debug_log_dt(
@@ -84,8 +87,13 @@ def append_debug_log_dt(
         "data": data,
         "timestamp": int(time.time() * 1000),
     }
-    with open(DEBUG_LOG_PATH, "a") as log_file:
-        log_file.write(json.dumps(log_entry) + "\n")
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a") as log_file:
+            log_file.write(json.dumps(log_entry) + "\n")
+    except OSError:
+        # Debug logging is best-effort; never let it abort tokenization.
+        pass
 
 
 # ----------------------------------------------------------------------------
@@ -803,9 +811,16 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
 
 
 def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
-    config = AutoConfig.from_pretrained(tc.tokenizer_name_or_path, revision=tc.tokenizer_revision)
+    try:
+        config = AutoConfig.from_pretrained(tc.tokenizer_name_or_path, revision=tc.tokenizer_revision)
+        model_type = config.model_type
+    except (ValueError, KeyError):
+        # Older transformers may not recognize newer architectures (e.g. olmo3).
+        # Only model_type is needed below (to gate OLMo-specific assertions), so
+        # fall back to inferring it from the model name.
+        model_type = tc.tokenizer_name_or_path.lower()
     # @vwxyzjn: "olmo" handles both `olmo2` and `olmoe`.
-    if "olmo" in config.model_type:
+    if "olmo" in model_type:
         if tc.chat_template_name is None:
             pass  # just assume the user knows what they're doing
         elif "olmo" in tc.chat_template_name:

@@ -165,3 +165,7 @@ scratch/
 oellm/train/logs/
 oellm/evaluations/logs/
 oellm/experiments/*/logs/
+oellm/pipelines/*/logs/
+
+# Converted/large model checkpoints (28GB+ OLMo-core dumps)
+checkpoints/

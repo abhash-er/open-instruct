@@ -86,7 +86,12 @@ from open_instruct.dataset_transformation import (
 )
 from open_instruct.utils import ArgumentParserPlus, is_beaker_job
 
-DEBUG_LOG_PATH = "/work/dlclarge2/ferreira-oellm/open-instruct/.cursor/debug.log"
+# Overridable; defaults next to this script. The original hardcoded HoreKa path
+# (/work/dlclarge2/...) does not exist on other clusters and crashed the run.
+DEBUG_LOG_PATH = os.environ.get(
+    "OLMOCORE_DEBUG_LOG_PATH",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "olmocore_debug.log"),
+)
 
 
 def append_debug_log(
@@ -107,8 +112,13 @@ def append_debug_log(
         "data": data,
         "timestamp": int(time.time() * 1000),
     }
-    with open(DEBUG_LOG_PATH, "a") as log_file:
-        log_file.write(json.dumps(log_entry) + "\n")
+    # Debug logging must never be fatal to the actual job.
+    try:
+        os.makedirs(os.path.dirname(DEBUG_LOG_PATH), exist_ok=True)
+        with open(DEBUG_LOG_PATH, "a") as log_file:
+            log_file.write(json.dumps(log_entry) + "\n")
+    except OSError:
+        pass
 
 
 def save_checkpoint(output_dir: str, checkpoint_data: Dict[str, Any]) -> None:

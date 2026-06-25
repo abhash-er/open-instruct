@@ -1,0 +1,27 @@
+# IF mixture: 50% English (Dolci replay), 50% EU (synthetic), 500k samples
+# EU split equally across 11 langs (~22,727 samples/lang).
+# EU source: synthgen-if (synthetic). English source: dolci-replay (~250,000 samples).
+# Real EU sources to be mixed in later experiments.
+
+name: synthif-500k-50en
+total_samples: 500000
+english_ratio: 0.5
+
+languages:
+  es: 0.045455
+  fr: 0.045455
+  de: 0.045455
+  it: 0.045455
+  pt: 0.045455
+  pl: 0.045455
+  nl: 0.045455
+  cs: 0.045455
+  ro: 0.045455
+  el: 0.045455
+  uk: 0.045450
+
+sources:
+  - synthgen-if
+  - dolci-replay
+
+seed: 42
