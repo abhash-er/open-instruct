@@ -2,7 +2,7 @@
 #SBATCH --job-name=synthif-5step
 #SBATCH --account=project_465002530
 #SBATCH --partition=dev-g
-#SBATCH --nodes=1
+#SBATCH --nodes=2
 #SBATCH --gpus-per-node=8
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
@@ -32,8 +32,17 @@ set -euo pipefail
 
 export EXPERIMENT="${EXPERIMENT:-G1-100en}"
 export TEST_RUN=true
-export MAX_STEPS="${MAX_STEPS:-5}"
+export MAX_STEPS="${MAX_STEPS:-20}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"   # surface RCCL / aws-ofi-rccl init in the test log
 
+# Resolve the sibling train script. Under `sbatch`, SLURM relocates this batch
+# script to /var/spool/slurmd/<job>/slurm_script, so BASH_SOURCE no longer points
+# next to train_synthif_sft_lumi.sh -- fall back to SLURM_SUBMIT_DIR (the repo
+# root from which sbatch was invoked) for the batch path.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$HERE/train_synthif_sft_lumi.sh"
+TRAIN="$HERE/train_synthif_sft_lumi.sh"
+if [[ ! -f "$TRAIN" ]]; then
+  TRAIN="${SLURM_SUBMIT_DIR:-$PWD}/oellm/pipelines/training/train_synthif_sft_lumi.sh"
+fi
+[[ -f "$TRAIN" ]] || { echo "ERROR: cannot locate train_synthif_sft_lumi.sh (tried $HERE and $TRAIN)"; exit 1; }
+exec "$TRAIN"

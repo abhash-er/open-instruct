@@ -1,0 +1,73 @@
+# cotainr conda env spec for the Track-G LUMI *training* container
+# (lumi-trackg-train.sif). TRAINING ONLY -- no vLLM (see README.md).
+#
+# This bakes the exact stack validated end-to-end in the 5-step/20-step smoke
+# test on 2x MI250X nodes (full SFT run + checkpoint save, ~50% MFU). The pins
+# come from the working overlay venv's `pip freeze` (venv-pip-freeze.txt).
+#
+# WHY these versions (the hard-won ones):
+#   torch 2.7.1+rocm6.2.4   -> olmo_core 2.3 needs FSDP2 (torch.distributed.fsdp.
+#                              FSDPModule), only in torch >= 2.7. ROCm 6.2.4 wheel
+#                              self-bundles its ROCm userspace + pytorch-triton-rocm
+#                              (which liger-kernel imports as `triton`).
+#   flash_attn 2.6.3        -> local wheel, compiled against THIS torch for gfx90a
+#                              (build_flash_attn_lumi.sh). Kept (no SDPA fallback).
+#   ring_flash_attn 0.1.8   -> local PATCHED wheel: context parallelism (cp_degree=2,
+#     +lumipatch                mandatory on MI250X) needs ring attention. Stock 0.1.8
+#                              eagerly imports an HF adapter against a transformers API
+#                              this stack lacks; the patch makes that import optional
+#                              (OLMo-core only uses the core ring/zigzag dispatch funcs).
+#                              A baked SIF is read-only, so the patch must be a wheel.
+#   liger-kernel 0.6.2      -> olmo_core pins it; its fused-linear-CE returns (loss,
+#                              z_loss). 0.8.0 returns a 4-tuple -> ValueError. Fused
+#                              linear CE avoids materializing the (tokens x vocab) logits.
+#   omegaconf 2.3.0         -> needs OmegaConf.to_object (2.0.x lacked it).
+#   transformers 4.45.1     -> tokenizer/model-build path that reached training.
+#
+# NOTE: ai2-olmo-core itself is NOT installed -- the training code runs from the
+# bound OLMo-core fork via PYTHONPATH (it holds our ROCm/MI250X patches). We only
+# install its runtime deps here.
+name: trackg-train
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/rocm6.2.4
+      # --- compiled / ROCm stack ---
+      - torch==2.7.1+rocm6.2.4
+      - torchvision==0.22.1+rocm6.2.4
+      # Local wheels served over localhost by build_container_lumi.sh during the build.
+      # cotainr's build sandbox runs `singularity exec --no-home` with NO /pfs bind, so
+      # filesystem paths to these wheels are invisible inside it (-> OSError). Singularity
+      # shares the host network, so we fetch them over http://127.0.0.1:$WHEEL_PORT. A full
+      # URL (not --find-links) forces THESE exact wheels -- our flash-attn is a ROCm build
+      # sharing the cp312/linux_x86_64 tag with PyPI's CUDA flash-attn 2.6.3, so a bare
+      # `flash-attn==2.6.3` could resolve to the wrong (CUDA) wheel.
+      - http://127.0.0.1:__WHEEL_PORT__/flash_attn-2.6.3-cp312-cp312-linux_x86_64.whl
+      - http://127.0.0.1:__WHEEL_PORT__/ring_flash_attn-0.1.8+lumipatch-py3-none-any.whl
+      # liger-kernel: patched wheel (triton hard-dep stripped). Stock 0.6.2 requires
+      # `triton>=2.3.1`, which a fresh resolve pulls from PyPI (CUDA build) and which
+      # collides with the `pytorch-triton-rocm` that torch 2.7.1+rocm6.2.4 brings (both
+      # install the `triton` module). We install liger --no-deps-style via this URL so
+      # only torch's tested ROCm triton remains -- same effect as our venv's
+      # `pip install --no-deps liger-kernel==0.6.2`.
+      - http://127.0.0.1:__WHEEL_PORT__/liger_kernel-0.6.2+notriton-py3-none-any.whl
+      # --- training deps (olmo_core runtime + SFT extras) ---
+      - omegaconf==2.3.0
+      - transformers==4.45.1
+      - tokenizers==0.20.0
+      - numpy==1.26.4
+      - cached-path==1.8.10
+      - safetensors==0.4.5
+      - importlib_resources==7.1.0
+      - bettermap==1.3.1
+      - wandb==0.18.1
+      # rich: left unpinned -- cached-path 1.8.10 caps it at <14.0, so an explicit
+      # rich==15 (what the overlay venv happened to inherit) is a hard conflict here.
+      - einops==0.8.2
+      - sentencepiece==0.2.0
+      - protobuf==5.29.6
+      - requests
+      - packaging

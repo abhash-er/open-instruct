@@ -30,11 +30,28 @@ set -euo pipefail
 # === paths (filesystem stays under project_462001516) =========================
 SCRATCH=/pfs/lustrep1/scratch/project_462001516
 LUMI_DIR="$SCRATCH/abhasjha/lumi-container"
-SIF="$LUMI_DIR/lumi-pytorch-rocm-6.2.1-python-3.12-pytorch-20240918-vllm-4075b35.sif"
-VENV="$LUMI_DIR/venv"
 PROJECT_ROOT="$SCRATCH/abhasjha/fabio-open-instruct/open-instruct"
 OLMOCORE_PATH="$SCRATCH/abhasjha/fabio-open-instruct/OLMo-core"
 OLMO_SFT="$OLMOCORE_PATH/src/scripts/train/sft/OLMo-sft.py"
+
+# === container selection ======================================================
+# Two interchangeable execution environments (see oellm/pipelines/container/README):
+#   default            -> base SIF + the --system-site-packages overlay venv (enter.sh).
+#                         Validated path; needs the conda+venv activation below.
+#   USE_TRACKG_SIF=1   -> the self-contained cotainr image (lumi-trackg-train.sif): the
+#                         whole stack is baked + auto-activated, so NO venv/conda source,
+#                         but the aws-ofi-rccl plugin (absent from the rocm-6.2 base) must
+#                         be bound in for RCCL-over-Slingshot.
+VENV="$LUMI_DIR/venv"
+if [[ "${USE_TRACKG_SIF:-0}" == "1" ]]; then
+  SIF="${TRACKG_SIF:-$LUMI_DIR/lumi-trackg-train.sif}"
+  ACTIVATE_BLOCK=":  # self-contained image: conda env is baked + auto-activated"
+  AWS_OFI_BIND="--bind $LUMI_DIR/aws-ofi-rccl:/opt/aws-ofi-rccl"
+else
+  SIF="$LUMI_DIR/lumi-pytorch-rocm-6.2.1-python-3.12-pytorch-20240918-vllm-4075b35.sif"
+  ACTIVATE_BLOCK="source /opt/miniconda3/bin/activate pytorch; source \"$VENV/bin/activate\""
+  AWS_OFI_BIND=""
+fi
 
 # === experiment config ========================================================
 EXPERIMENT="${EXPERIMENT:?Usage: EXPERIMENT=G1-100en sbatch train_synthif_sft_lumi.sh}"
@@ -43,14 +60,24 @@ CLUSTER_NAME="slurm"   # not in OLMo-sft's Beaker map -> it infers GPU type from
 
 SCALE="${SCALE:-500k}"   # which tokenized scale to train on (matches tokenize_trackG_lumi.sh)
 DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/data/datasets_multilingual_sft/tokenized/${SCALE}/${EXPERIMENT}}"
-BASE_CKPT="${BASE_CKPT:-${PROJECT_ROOT}/checkpoints/base/Olmo-3-7B-Instruct-SFT-olmocore}"
+# Point at the model_and_optim subdir, not its parent: olmo_core's load_checkpoint
+# gates on dir_is_checkpoint(), which only accepts a dir with a top-level `.metadata`
+# (our DCP metadata lives at model_and_optim/.metadata) or a full trainer checkpoint
+# (train/rank0.pt + .metadata.json -- which a converted base model has not). The
+# parent dir matches neither -> "No checkpoints found". model_and_optim/ has the
+# top-level .metadata, so dir_is_checkpoint passes and load() reads the DCP there.
+BASE_CKPT="${BASE_CKPT:-${PROJECT_ROOT}/checkpoints/base/Olmo-3-7B-Instruct-SFT-olmocore/model_and_optim}"
 
 # === hyperparameters (OLMo-3 SFT recipe; override via env) ====================
 LEARNING_RATE="${LEARNING_RATE:-8e-5}"
 SEQ_LEN="${SEQ_LEN:-32768}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-$((SEQ_LEN * 32))}"   # ~1M tokens
-# MI250X GCD has 64GB (vs A100-80GB), so default the per-rank microbatch lower
-# than the Horeka 24576 -- raise it if memory allows.
+# Per-rank microbatch cap (passed as --max_rank_microbatch_size_tokens, same as the
+# Horeka scripts). At 16384 = SEQ_LEN/2 it forces cp_degree=2, so each 32768-token
+# sequence is split across 2 GCDs. This is REQUIRED on MI250X: at 32768 (cp_degree=1)
+# the smallest possible microbatch is one full 32768-token sequence, which OOMs the
+# 64GB GCD (~54GB). cp_degree=2 ~halves activation memory (the Horeka A100-80GB runs
+# could afford cp_degree=1; the MI250X cannot).
 MAX_RANK_MICROBATCH_SIZE_TOKENS="${MAX_RANK_MICROBATCH_SIZE_TOKENS:-16384}"
 SAVE_INTERVAL="${SAVE_INTERVAL:-200}"
 
@@ -104,7 +131,12 @@ echo "=============================================="
 
 # === per-rank launcher (one task per GCD) =====================================
 # Written to a temp file to keep the srun -> singularity -> python nesting sane.
-RUNNER="$(mktemp "${TMPDIR:-/tmp}/synthif_runner.XXXXXX.sh")"
+# MUST live on shared Lustre (not node-local /tmp): srun launches this on every
+# node, and a /tmp path only exists on the batch node -> the other nodes fail
+# with `execve(): ... No such file or directory`.
+RUNNER_DIR="$PROJECT_ROOT/oellm/pipelines/training/logs/.runners"
+mkdir -p "$RUNNER_DIR"
+RUNNER="$(mktemp "$RUNNER_DIR/synthif_runner.XXXXXX.sh")"
 trap 'rm -f "$RUNNER"' EXIT
 cat > "$RUNNER" <<EOF
 #!/usr/bin/env bash
@@ -129,11 +161,12 @@ singularity exec \
   --bind /var/spool/slurmd:/var/spool/slurmd \
   --bind /usr/lib64/libcxi.so.1:/usr/lib64/libcxi.so.1 \
   --bind /usr/lib64/libjansson.so.4:/usr/lib64/libjansson.so.4 \
+  $AWS_OFI_BIND \
   "$SIF" bash -c '
     set -euo pipefail
-    source /opt/miniconda3/bin/activate pytorch
-    source "$VENV/bin/activate"
-    # RCCL over Slingshot via the container-bundled aws-ofi-rccl plugin
+    $ACTIVATE_BLOCK
+    # RCCL over Slingshot via the aws-ofi-rccl plugin (bundled in the base SIF; bound
+    # in from scratch for the self-contained trackg image)
     export LD_LIBRARY_PATH=/opt/aws-ofi-rccl:/opt/cray/lib64:\${LD_LIBRARY_PATH:-}
     export NCCL_SOCKET_IFNAME=hsn0,hsn1,hsn2,hsn3
     export NCCL_NET_GDR_LEVEL=PHB

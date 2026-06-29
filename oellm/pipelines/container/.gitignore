@@ -1,0 +1,7 @@
+# Built wheels are large (flash_attn ~27MB) and regenerable -- see README +
+# build_flash_attn_lumi.sh and the ring/liger patch steps. Not tracked.
+wheels/
+# cotainr / slurm build logs
+logs/
+cotainr_build_*.out
+cotainr_build_*.err
