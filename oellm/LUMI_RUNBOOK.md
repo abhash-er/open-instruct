@@ -251,6 +251,10 @@ not a hang; confirm progress with `sstat -j <jobid> --format=AveCPU,MaxRSS`.
 EXPERIMENT=G1-100en sbatch oellm/pipelines/training/test_train_5step_lumi.sh
 ```
 
+> Training runs default to the self-contained `lumi-trackg-train.sif` (no venv needed;
+> see `oellm/pipelines/container/README.md`). Pass `USE_TRACKG_SIF=0` to fall back to the
+> legacy base-SIF + overlay-venv path.
+
 ### 7e. Full training (multi-node)
 ```bash
 EXPERIMENT=G1-100en SCALE=500k sbatch oellm/pipelines/training/train_synthif_sft_lumi.sh

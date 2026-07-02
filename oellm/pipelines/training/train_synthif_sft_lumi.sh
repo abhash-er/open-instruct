@@ -7,6 +7,8 @@
 #SBATCH --ntasks-per-node=8
 #SBATCH --cpus-per-task=7
 #SBATCH --mem=0
+# Default wall = 24h, which fits the 500k runs. The 1M runs need longer: pass
+# `--time=30:00:00` on the sbatch line for SCALE=1M (a CLI --time overrides this).
 #SBATCH --time=24:00:00
 #SBATCH --output=/pfs/lustrep1/scratch/project_462001516/abhasjha/fabio-open-instruct/open-instruct/oellm/pipelines/training/logs/%x_%j.out
 #SBATCH --error=/pfs/lustrep1/scratch/project_462001516/abhasjha/fabio-open-instruct/open-instruct/oellm/pipelines/training/logs/%x_%j.err
@@ -20,9 +22,17 @@
 # feed each task RANK/LOCAL_RANK/WORLD_SIZE/MASTER_ADDR. No accelerate/deepspeed
 # (deepspeed isn't in the container, and olmo_core doesn't use it).
 #
-# Usage (production, 2 nodes x 8 GCD = 16):
-#   EXPERIMENT=G1-100en sbatch oellm/pipelines/training/train_synthif_sft_lumi.sh
-#   EXPERIMENT=G3-50en NUM_NODES_HINT=4 sbatch -N4 oellm/pipelines/training/train_synthif_sft_lumi.sh
+# Runs on the standard-g partition (2 nodes x 8 GCD = 16; full-node jobs, so
+# billed the same as small-g but with a shorter queue). Wall time is scale-
+# dependent: 500k -> 24h (the SBATCH default), 1M -> 30h (pass --time=30:00:00).
+#
+# Usage (production):
+#   # 500k (24h default):
+#   EXPERIMENT=G1-100en SCALE=500k RUN_NAME=synthif-G1-100en-500k \
+#     sbatch oellm/pipelines/training/train_synthif_sft_lumi.sh
+#   # 1M (override to 30h):
+#   EXPERIMENT=G1-100en SCALE=1M RUN_NAME=synthif-G1-100en-1M \
+#     sbatch --time=30:00:00 oellm/pipelines/training/train_synthif_sft_lumi.sh
 # Smoke test (5 steps) -> use test_train_5step_lumi.sh, which sets TEST_RUN/MAX_STEPS.
 
 set -euo pipefail
@@ -36,14 +46,18 @@ OLMO_SFT="$OLMOCORE_PATH/src/scripts/train/sft/OLMo-sft.py"
 
 # === container selection ======================================================
 # Two interchangeable execution environments (see oellm/pipelines/container/README):
-#   default            -> base SIF + the --system-site-packages overlay venv (enter.sh).
-#                         Validated path; needs the conda+venv activation below.
-#   USE_TRACKG_SIF=1   -> the self-contained cotainr image (lumi-trackg-train.sif): the
+#   default (SIF)      -> the self-contained cotainr image (lumi-trackg-train.sif): the
 #                         whole stack is baked + auto-activated, so NO venv/conda source,
 #                         but the aws-ofi-rccl plugin (absent from the rocm-6.2 base) must
-#                         be bound in for RCCL-over-Slingshot.
+#                         be bound in for RCCL-over-Slingshot. This is the canonical Track-G
+#                         path -- validated end-to-end on 2x MI250X (job 19623751: 20 steps,
+#                         checkpoint saves, ~50% MFU), reproducible from the recipe in
+#                         oellm/pipelines/container/ with no overlay venv to maintain.
+#   USE_TRACKG_SIF=0   -> legacy path: base SIF + the --system-site-packages overlay venv
+#                         (enter.sh); needs the conda+venv activation below. Kept as an
+#                         opt-out escape hatch only.
 VENV="$LUMI_DIR/venv"
-if [[ "${USE_TRACKG_SIF:-0}" == "1" ]]; then
+if [[ "${USE_TRACKG_SIF:-1}" == "1" ]]; then
   SIF="${TRACKG_SIF:-$LUMI_DIR/lumi-trackg-train.sif}"
   ACTIVATE_BLOCK=":  # self-contained image: conda env is baked + auto-activated"
   AWS_OFI_BIND="--bind $LUMI_DIR/aws-ofi-rccl:/opt/aws-ofi-rccl"
@@ -55,10 +69,12 @@ fi
 
 # === experiment config ========================================================
 EXPERIMENT="${EXPERIMENT:?Usage: EXPERIMENT=G1-100en sbatch train_synthif_sft_lumi.sh}"
-RUN_NAME="${RUN_NAME:-synthif-${EXPERIMENT}}"
-CLUSTER_NAME="slurm"   # not in OLMo-sft's Beaker map -> it infers GPU type from the device
-
 SCALE="${SCALE:-500k}"   # which tokenized scale to train on (matches tokenize_trackG_lumi.sh)
+# Track-aware, scale-tagged run name. The G* experiments are Track G (synthif
+# mixtures), so the name is trackG-<experiment>-<scale> -> a unique W&B run AND
+# checkpoint folder per (experiment, scale); 500k and 1M can never collide.
+RUN_NAME="${RUN_NAME:-trackG-${EXPERIMENT}-${SCALE}}"
+CLUSTER_NAME="slurm"   # not in OLMo-sft's Beaker map -> it infers GPU type from the device
 DATASET_PATH="${DATASET_PATH:-${PROJECT_ROOT}/data/datasets_multilingual_sft/tokenized/${SCALE}/${EXPERIMENT}}"
 # Point at the model_and_optim subdir, not its parent: olmo_core's load_checkpoint
 # gates on dir_is_checkpoint(), which only accepts a dir with a top-level `.metadata`
@@ -108,13 +124,28 @@ TOTAL_GPUS=$((GPUS_PER_NODE * NUM_NODES))
 export MASTER_ADDR="$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1)"
 export MASTER_PORT=$((29500 + (${SLURM_JOB_ID:-0} % 10000)))
 
-# === W&B (off unless WANDB_API_KEY is set) ====================================
+# === W&B ======================================================================
+# Pull the key from ~/.netrc (written by `wandb login`) if it isn't already in
+# the env, then export it so (a) auto-enable below trips true and (b) it
+# propagates sbatch -> srun -> singularity to the trainer -- more reliable than
+# depending on ~/.netrc being bound into the container on every compute node.
+if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.netrc" ]]; then
+  WANDB_API_KEY="$(awk '/machine api.wandb.ai/{f=1} f&&/password/{print $2; exit}' "$HOME/.netrc")"
+  [[ -n "$WANDB_API_KEY" ]] && export WANDB_API_KEY
+fi
 WANDB_ENABLED="${WANDB_ENABLED:-auto}"
 if [[ "$WANDB_ENABLED" == "auto" ]]; then
   [[ -n "${WANDB_API_KEY:-}" ]] && WANDB_ENABLED=true || WANDB_ENABLED=false
 fi
-WANDB_PROJECT="${WANDB_PROJECT:-olmo-synthif-sft}"
-WANDB_ENTITY="${WANDB_ENTITY:-}"
+# Fixed for this pipeline. Plain assignment (NOT ${VAR:-default}) on purpose: the
+# login shell exports WANDB_PROJECT=openeurollm globally, which would otherwise
+# leak in via the :-default and misroute these runs. Edit here to change.
+WANDB_PROJECT="multilingual-SFT"
+WANDB_ENTITY="openeurollm-project"
+# wandb needs a writable run dir; the inherited /scratch form is read-only inside
+# the container -> use a canonical /pfs path.
+export WANDB_DIR="${WANDB_DIR:-$PROJECT_ROOT/oellm/pipelines/training/logs/wandb}"
+mkdir -p "$WANDB_DIR"
 
 mkdir -p "$PROJECT_ROOT/oellm/pipelines/training/logs"
 
